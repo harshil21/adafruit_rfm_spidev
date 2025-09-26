@@ -638,7 +638,7 @@ class RFM9x:
         packet = self.read_fifo()
         if packet is None:  # Timed out or no data waiting.
             return None
-        if self.enable_crc and self.crc_error():
+        if self.enable_crc and self.crc_error:
             return None
         if with_header:
             if len(packet) < 4:
