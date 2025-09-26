@@ -597,3 +597,59 @@ class RFM9x:
 
     def __del__(self) -> None:
         self._spi.close()
+
+    def send(self, data: ReadableBuffer, *, timeout: float = 0) -> bool:
+        """Send a packet containing up to 252 bytes of data.
+
+        :param data: Packet to send
+        :param timeout: How long to wait for packet to be sent
+        :return: True if the packet was sent successfully, False if it timed out.
+        """
+        self.idle()  # Stop receiving to clear FIFO and set mode to idle.
+        self.clear_interrupt()  # Clear FIFO done flag first.
+        # Fill the FIFO with data
+        self.fill_fifo(data)
+        # Transmit.
+        self.transmit()
+        # Wait for packet sent interrupt with explicit polling (instead of interrupt
+        # handlers which require thread support).
+        start = time.monotonic()
+        timed_out = False
+        while not timed_out and not self.packet_sent():
+            if timeout != 0 and (time.monotonic() - start) >= timeout:
+                timed_out = True
+        # Go back to idle mode after transmit.
+        self.idle()
+        return not timed_out
+
+    def receive(self, *, with_header: bool = False, timeout: float = 0) -> Optional[bytearray]:
+        """Receive a packet, if one has been received.
+
+        :param with_header: Expect 4-byte RadioHead header as first 4 bytes of data.
+        :param timeout: How long to listen in idle mode before giving up.
+        :return: packet, if received while waiting. Otherwise None
+        """
+        self.listen()  # Make sure we are listening.
+        start = time.monotonic()
+        timed_out = False
+        while not timed_out and not self.payload_ready():
+            if timeout != 0 and (time.monotonic() - start) >= timeout:
+                timed_out = True
+        packet = self.read_fifo()
+        if packet is None:  # Timed out or no data waiting.
+            return None
+        if self.enable_crc and self.crc_error():
+            return None
+        if with_header:
+            if len(packet) < 4:
+                return None
+            if packet[0] != _RH_BROADCAST_ADDRESS:  # To
+                return None
+            if packet[1] != _RH_BROADCAST_ADDRESS:  # From
+                return None
+            if packet[2] != 0:  # ID
+                return None
+            if packet[3] != 0:  # Flags
+                return None
+            packet = packet[4:]
+        return packet
