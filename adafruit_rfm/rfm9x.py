@@ -15,11 +15,10 @@ import time
 
 from micropython import const
 
-from adafruit_rfm.rfm_common import RFMSPI
+import spidev
+import digitalio
 
 try:
-    import busio
-    import digitalio
     from circuitpython_typing import ReadableBuffer
 
     try:
@@ -116,15 +115,12 @@ RX_MODE = 0b101
 
 
 # pylint: disable=too-many-instance-attributes
-class RFM9x(RFMSPI):
+class RFM9x:
     """Interface to a RFM95/6/7/8 LoRa radio module.  Allows sending and
     receiving bytes of data in long range LoRa mode at a support board frequency
     (433/915mhz).
 
     You must specify the following parameters:
-    - spi: The SPI bus connected to the radio.
-    - cs: The CS pin DigitalInOut connected to the radio.
-    - reset: The reset/RST pin DigialInOut connected to the radio.
     - frequency: The frequency (in mhz) of the radio module (433/915mhz typically).
 
     You can optionally specify:
@@ -148,68 +144,89 @@ class RFM9x(RFMSPI):
     limitations noted, "reliable datagram" is still subject to missed packets.
     """
 
-    operation_mode = RFMSPI.RegisterBits(_RF95_REG_01_OP_MODE, bits=3)
+    class RegisterBits:  # pylint: disable=too-few-public-methods
+        """Access specific bits or slices in a register"""
 
-    low_frequency_mode = RFMSPI.RegisterBits(_RF95_REG_01_OP_MODE, offset=3, bits=1)
+        def __init__(self, address: int, *, offset: int = 0, bits: int = 1) -> None:
+            self.address = address
+            self.bitmask = ((1 << bits) - 1) << offset
+            self.bitshift = offset
 
-    modulation_type = RFMSPI.RegisterBits(_RF95_REG_01_OP_MODE, offset=5, bits=2)
+        def __get__(self, obj: Optional["RFM9x"], objtype: type["RFM9x"]) -> int:
+            reg_value = obj.read_u8(self.address) if obj else 0
+            return (reg_value & self.bitmask) >> self.bitshift
+
+        def __set__(self, obj: "RFM9x", val: int) -> None:
+            reg_value = obj.read_u8(self.address)
+            reg_value &= ~self.bitmask
+            reg_value |= (val << self.bitshift) & self.bitmask
+            obj.write_u8(self.address, reg_value)
+
+    operation_mode = RegisterBits(_RF95_REG_01_OP_MODE, bits=3)
+
+    low_frequency_mode = RegisterBits(_RF95_REG_01_OP_MODE, offset=3, bits=1)
+
+    modulation_type = RegisterBits(_RF95_REG_01_OP_MODE, offset=5, bits=2)
 
     # Long range/LoRa mode can only be set in sleep mode!
-    long_range_mode = RFMSPI.RegisterBits(_RF95_REG_01_OP_MODE, offset=7, bits=1)
+    long_range_mode = RegisterBits(_RF95_REG_01_OP_MODE, offset=7, bits=1)
 
-    output_power = RFMSPI.RegisterBits(_RF95_REG_09_PA_CONFIG, bits=4)
+    output_power = RegisterBits(_RF95_REG_09_PA_CONFIG, bits=4)
 
-    max_power = RFMSPI.RegisterBits(_RF95_REG_09_PA_CONFIG, offset=4, bits=3)
+    max_power = RegisterBits(_RF95_REG_09_PA_CONFIG, offset=4, bits=3)
 
-    pa_select = RFMSPI.RegisterBits(_RF95_REG_09_PA_CONFIG, offset=7, bits=1)
+    pa_select = RegisterBits(_RF95_REG_09_PA_CONFIG, offset=7, bits=1)
 
-    pa_dac = RFMSPI.RegisterBits(_RF95_REG_4D_PA_DAC, bits=3)
+    pa_dac = RegisterBits(_RF95_REG_4D_PA_DAC, bits=3)
 
-    dio0_mapping = RFMSPI.RegisterBits(_RF95_REG_40_DIO_MAPPING1, offset=6, bits=2)
+    dio0_mapping = RegisterBits(_RF95_REG_40_DIO_MAPPING1, offset=6, bits=2)
 
-    auto_agc = RFMSPI.RegisterBits(_RF95_REG_26_MODEM_CONFIG3, offset=2, bits=1)
+    auto_agc = RegisterBits(_RF95_REG_26_MODEM_CONFIG3, offset=2, bits=1)
 
-    header_mode = RFMSPI.RegisterBits(_RF95_REG_1D_MODEM_CONFIG1, offset=0, bits=1)
+    header_mode = RegisterBits(_RF95_REG_1D_MODEM_CONFIG1, offset=0, bits=1)
 
-    low_datarate_optimize = RFMSPI.RegisterBits(_RF95_REG_26_MODEM_CONFIG3, offset=3, bits=1)
+    low_datarate_optimize = RegisterBits(_RF95_REG_26_MODEM_CONFIG3, offset=3, bits=1)
 
-    lna_boost_hf = RFMSPI.RegisterBits(_RF95_REG_0C_LNA, offset=0, bits=2)
+    lna_boost_hf = RegisterBits(_RF95_REG_0C_LNA, offset=0, bits=2)
 
-    auto_ifon = RFMSPI.RegisterBits(_RF95_DETECTION_OPTIMIZE, offset=7, bits=1)
+    auto_ifon = RegisterBits(_RF95_DETECTION_OPTIMIZE, offset=7, bits=1)
 
-    detection_optimize = RFMSPI.RegisterBits(_RF95_DETECTION_OPTIMIZE, offset=0, bits=3)
+    detection_optimize = RegisterBits(_RF95_DETECTION_OPTIMIZE, offset=0, bits=3)
 
     bw_bins = (7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000)
 
     def __init__(  # noqa: PLR0913
         self,
-        spi: busio.SPI,
-        cs: digitalio.DigitalInOut,  # pylint: disable=invalid-name
-        rst: digitalio.DigitalInOut,
         frequency: int,
+        reset: digitalio.DigitalInOut,
         *,
         preamble_length: int = 8,
         high_power: bool = True,
         baudrate: int = 5000000,
         agc: bool = False,
         crc: bool = True,
+        spi_bus: int = 0,
+        cs_device: int = 0,
     ) -> None:
-        super().__init__(spi, cs, baudrate=baudrate)
         self.module = "RFM9X"
         self.max_packet_length = 252
         self.high_power = high_power
         # Device support SPI mode 0 (polarity & phase = 0) up to a max of 10mhz.
         # Set Default Baudrate to 5MHz to avoid problems
-        # self._device = spidev.SPIDevice(spi, cs, baudrate=baudrate, polarity=0, phase=0)
+        self._spi = spidev.SpiDev()
+        self._spi.open(spi_bus, cs_device)
+        self._spi.max_speed_hz = baudrate
+        self._spi.mode = 0
+        self._spi.bits_per_word = 8
         # Setup reset as a digital output - initially High
         # This line is pulled low as an output quickly to trigger a reset.
-        self._rst = rst
-        # initialize Reset High
-        self._rst.switch_to_output(value=True)
+        self._rst = reset
+        self._rst.direction = digitalio.Direction.OUTPUT
+        self._rst.value = True
         self.reset()
         # No device type check!  Catch an error from the very first request and
         # throw a nicer message to indicate possible wiring problems.
-        version = self.read_u8(address=_RF95_REG_42_VERSION)
+        version = self.read_u8(_RF95_REG_42_VERSION)
         if version != 18:
             raise RuntimeError(
                 "Failed to find rfm9x with expected version -- check wiring. Version found:",
@@ -556,3 +573,27 @@ class RFM9x(RFMSPI):
             # clear interrupt
             self.write_u8(_RF95_REG_12_IRQ_FLAGS, 0xFF)
         return packet
+
+    def read_u8(self, address: int) -> int:
+        resp = self._spi.xfer2([address & 0x7F, 0x00])
+        return resp[1]
+
+    def write_u8(self, address: int, val: int) -> None:
+        self._spi.xfer2([address | 0x80, val & 0xFF])
+
+    def read_into(self, address: int, buf: bytearray, length: Optional[int] = None) -> None:
+        if length is None:
+            length = len(buf)
+        data = [address & 0x7F] + [0x00] * length
+        resp = self._spi.xfer2(data)
+        for i in range(length):
+            buf[i] = resp[i + 1]
+
+    def write_from(self, address: int, buf: ReadableBuffer, length: Optional[int] = None) -> None:
+        if length is None:
+            length = len(buf)
+        data = [address | 0x80] + list(buf[:length])
+        self._spi.xfer2(data)
+
+    def __del__(self) -> None:
+        self._spi.close()

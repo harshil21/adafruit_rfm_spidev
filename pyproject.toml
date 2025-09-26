@@ -28,6 +28,7 @@ keywords = [
     "RFM69",
     "RFM9x",
     "radio",
+    "spidev",
 ]
 license = {text = "MIT"}
 classifiers = [
